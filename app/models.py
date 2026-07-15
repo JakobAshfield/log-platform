@@ -1,6 +1,7 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Literal
 import datetime
+
 
 class LogEntryCreate(BaseModel):
     level: Literal["info", "warn", "error"]
@@ -8,5 +9,6 @@ class LogEntryCreate(BaseModel):
 
 
 class LogEntry(LogEntryCreate):
+    model_config = ConfigDict(from_attributes=True)
     id: int
     timestamp: datetime.datetime

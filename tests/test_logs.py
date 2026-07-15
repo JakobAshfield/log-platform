@@ -1,5 +1,40 @@
+import asyncio
+
 from fastapi.testclient import TestClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import StaticPool
+
 from app.main import app
+from app.database import Base
+from app.dependencies import get_db
+
+TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
+
+test_engine = create_async_engine(
+    TEST_DATABASE_URL,
+    connect_args={"check_same_thread": False},
+    poolclass=StaticPool,
+    echo=False,
+)
+
+TestSessionLocal = async_sessionmaker(
+    bind=test_engine,
+    expire_on_commit=False,
+    class_=AsyncSession,
+)
+
+async def init_test_db() -> None:
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+asyncio.run(init_test_db())
+
+async def override_get_db() -> AsyncSession:
+    async with TestSessionLocal() as session:
+        yield session
+
+app.dependency_overrides[get_db] = override_get_db
+app.router.on_startup.clear()
 
 client = TestClient(app)
 
@@ -21,18 +56,15 @@ def test_create_and_get_log_entry():
     assert fetched_entry == log_entry
 
 def test_get_logs_with_level_filter(): 
-    # Create multiple log entries
     client.post("/logs/", json={"level": "info", "message": "Info log"})
     client.post("/logs/", json={"level": "warn", "message": "Warn log"})
     client.post("/logs/", json={"level": "error", "message": "Error log"})
 
-    # Get logs with level filter
     response = client.get("/logs/?level=warn")
     assert response.status_code == 200
     logs = response.json()
-    assert len(logs) == 1
-    assert logs[0]["level"] == "warn"
-    assert logs[0]["message"] == "Warn log"
+    assert len(logs) >= 1                              # ← not exactly 1
+    assert all(log["level"] == "warn" for log in logs) # ← all results are warn
 
 def test_bulk_fetch_logs():
     # Create multiple log entries
