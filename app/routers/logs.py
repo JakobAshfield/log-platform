@@ -1,20 +1,27 @@
 import asyncio
 import datetime
-from fastapi import APIRouter, HTTPException, status, Depends
+from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks, Response
 from app.models import LogEntry, LogEntryCreate
 from sqlalchemy.ext.asyncio import AsyncSession 
 from sqlalchemy import func, select
 from app.orm_models import LogEntryORM
-from app.dependencies import get_db
+from app.dependencies import get_db, rate_limit
+from app.redis_client import redis_client
 
 router = APIRouter()
 
 #log_entries: dict[int, LogEntry] = {}
 #next_id = 1
 
+async def warm_cache(entry: LogEntry) -> None:
+    try: 
+        await redis_client.set(f"log:{entry.id}", entry.model_dump_json(), ex=300)
+    except Exception:
+        pass
 
-@router.post("/", status_code=status.HTTP_201_CREATED, response_model=LogEntry)
-async def create_log_entry(log_entry: LogEntryCreate, db: AsyncSession = Depends(get_db)):                                 
+
+@router.post("/", dependencies=[Depends(rate_limit)] ,status_code=status.HTTP_201_CREATED, response_model=LogEntry)
+async def create_log_entry(log_entry: LogEntryCreate, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):                                 
     entry = LogEntryORM(
         level=log_entry.level,
         message=log_entry.message,
@@ -23,7 +30,11 @@ async def create_log_entry(log_entry: LogEntryCreate, db: AsyncSession = Depends
     db.add(entry)
     await db.commit()
     await db.refresh(entry)
-    return LogEntry.model_validate(entry)
+
+    pydantic_entry = LogEntry.model_validate(entry)
+    background_tasks.add_task(warm_cache, pydantic_entry)
+
+    return pydantic_entry
 
 
 @router.get("/", response_model=list[LogEntry])
@@ -64,12 +75,28 @@ async def slow_fetch(ids: str, db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/{log_id}", response_model=LogEntry)
-async def get_log_entry(log_id: int, db: AsyncSession = Depends(get_db)):
+async def get_log_entry(log_id: int,response: Response, db: AsyncSession = Depends(get_db)):
+    cache_key = f"log:{log_id}"
+    try:
+        cached_log = await redis_client.get(cache_key)
+        if cached_log:
+            response.headers["X-Cache"] = "HIT"
+            return LogEntry.model_validate_json(cached_log)
+    except Exception:
+        pass
+
     result = await db.execute(select(LogEntryORM).where(LogEntryORM.id == log_id))
     entry = result.scalar_one_or_none()
     if not entry:
         raise HTTPException(status_code=404, detail="Log entry not found")
-    return LogEntry.model_validate(entry)
+    pydantic_entry = LogEntry.model_validate(entry)
+    response.headers["X-Cache"] = "MISS"
+    try:
+        await redis_client.set(cache_key, pydantic_entry.model_dump_json(), ex=300)
+    except Exception:
+        pass
+
+    return pydantic_entry
 
 
 @router.delete("/{log_id}")
@@ -80,6 +107,12 @@ async def delete_log_entry(log_id: int, db: AsyncSession = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Log entry not found")
     await db.delete(entry)
     await db.commit()
+
+    try:
+        await redis_client.delete(f"log:{log_id}")
+    except Exception:
+        pass
+
     return {"message": "Log entry deleted"}
 
 @router.get("/stats")
