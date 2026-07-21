@@ -13,6 +13,8 @@ from app.orm_models import LogEntryORM
 # access to the values within the .ini file in use.
 config = context.config
 
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.
 
@@ -24,14 +26,11 @@ config = context.config
 from dotenv import load_dotenv
 load_dotenv()
 
+DATABASE_URL = os.getenv("DATABASE_URL", "")
+SYNC_DATABASE_URL = DATABASE_URL.replace("+asyncpg", "")
 config.set_main_option(
-    "sqlalchemy.url",
-    os.getenv("ALEMBIC_DATABASE_URL", "")
-)
+    "sqlalchemy.url", SYNC_DATABASE_URL)
 target_metadata = Base.metadata
-
-if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
 # my_important_option = config.get_main_option("my_important_option")
