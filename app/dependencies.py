@@ -1,8 +1,10 @@
 from typing import AsyncGenerator
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.database import AsyncSessionLocal
-from fastapi import HTTPException, status, Request
+from fastapi import HTTPException, status, Request, Depends
 from app.redis_client import redis_client
+from fastapi.security import OAuth2PasswordBearer
+from app.auth import decode_token
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with AsyncSessionLocal() as session:
@@ -27,3 +29,16 @@ async def rate_limit(request: Request):
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="Rate limit exceeded, try again later"
         )
+    
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+async def get_current_user(token: str = Depends(oauth2_scheme)) -> dict:
+    return decode_token(token)
+
+async def require_admin(user: dict = Depends(get_current_user)) -> dict:
+    if user.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="Admins only"
+        )
+    return user

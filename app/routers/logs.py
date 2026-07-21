@@ -5,8 +5,9 @@ from app.models import LogEntry, LogEntryCreate
 from sqlalchemy.ext.asyncio import AsyncSession 
 from sqlalchemy import func, select
 from app.orm_models import LogEntryORM
-from app.dependencies import get_db, rate_limit
+from app.dependencies import get_db, rate_limit, require_admin
 from app.redis_client import redis_client
+from app.metrics import log_ingest_counter, cache_hit_counter, cache_miss_counter
 
 router = APIRouter()
 
@@ -32,6 +33,7 @@ async def create_log_entry(log_entry: LogEntryCreate, background_tasks: Backgrou
     await db.refresh(entry)
 
     pydantic_entry = LogEntry.model_validate(entry)
+    log_ingest_counter.labels(level=pydantic_entry.level).inc()
     background_tasks.add_task(warm_cache, pydantic_entry)
 
     return pydantic_entry
@@ -81,6 +83,7 @@ async def get_log_entry(log_id: int,response: Response, db: AsyncSession = Depen
         cached_log = await redis_client.get(cache_key)
         if cached_log:
             response.headers["X-Cache"] = "HIT"
+            cache_hit_counter.inc()
             return LogEntry.model_validate_json(cached_log)
     except Exception:
         pass
@@ -91,6 +94,7 @@ async def get_log_entry(log_id: int,response: Response, db: AsyncSession = Depen
         raise HTTPException(status_code=404, detail="Log entry not found")
     pydantic_entry = LogEntry.model_validate(entry)
     response.headers["X-Cache"] = "MISS"
+    cache_miss_counter.inc()
     try:
         await redis_client.set(cache_key, pydantic_entry.model_dump_json(), ex=300)
     except Exception:
@@ -98,8 +102,13 @@ async def get_log_entry(log_id: int,response: Response, db: AsyncSession = Depen
 
     return pydantic_entry
 
+@router.get("/stats")
+async def get_log_stats(db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(LogEntryORM.level, func.count(LogEntryORM.id)).group_by(LogEntryORM.level))
+    stats = {level: count for level, count in result.all()}
+    return stats 
 
-@router.delete("/{log_id}")
+@router.delete("/{log_id}", dependencies=[Depends(require_admin)])
 async def delete_log_entry(log_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(select(LogEntryORM).where(LogEntryORM.id == log_id))
     entry = result.scalar_one_or_none()
@@ -114,9 +123,3 @@ async def delete_log_entry(log_id: int, db: AsyncSession = Depends(get_db)):
         pass
 
     return {"message": "Log entry deleted"}
-
-@router.get("/stats")
-async def get_log_stats(db: AsyncSession = Depends(get_db)):
-    result = await db.execute(select(LogEntryORM.level, func.count(LogEntryORM.id)).group_by(LogEntryORM.level))
-    stats = {level: count for level, count in result.all()}
-    return stats 
