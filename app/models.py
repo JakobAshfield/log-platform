@@ -34,3 +34,6 @@ class TokenRefreshRequest(BaseModel):
 class NewAccessTokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
+
+class LogBatch(BaseModel):
+    entries: list[LogEntryCreate]

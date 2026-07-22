@@ -1,13 +1,15 @@
 import asyncio
 import datetime
-from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks, Response
-from app.models import LogEntry, LogEntryCreate
+from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks, Response, WebSocket, WebSocketDisconnect
+from app.models import LogBatch, LogEntry, LogEntryCreate
 from sqlalchemy.ext.asyncio import AsyncSession 
 from sqlalchemy import func, select
 from app.orm_models import LogEntryORM
-from app.dependencies import get_db, rate_limit, require_admin
+from app.dependencies import get_db, rate_limit, require_admin, get_current_user
 from app.redis_client import redis_client
 from app.metrics import log_ingest_counter, cache_hit_counter, cache_miss_counter
+from app.websocket_manager import manager
+from app.kafka_producer import get_producer
 
 router = APIRouter()
 
@@ -21,7 +23,7 @@ async def warm_cache(entry: LogEntry) -> None:
         pass
 
 
-@router.post("/", dependencies=[Depends(rate_limit)] ,status_code=status.HTTP_201_CREATED, response_model=LogEntry)
+@router.post("/", dependencies=[Depends(rate_limit), Depends(get_current_user)] ,status_code=status.HTTP_201_CREATED, response_model=LogEntry)
 async def create_log_entry(log_entry: LogEntryCreate, background_tasks: BackgroundTasks, db: AsyncSession = Depends(get_db)):                                 
     entry = LogEntryORM(
         level=log_entry.level,
@@ -36,8 +38,12 @@ async def create_log_entry(log_entry: LogEntryCreate, background_tasks: Backgrou
     log_ingest_counter.labels(level=pydantic_entry.level).inc()
     background_tasks.add_task(warm_cache, pydantic_entry)
 
-    return pydantic_entry
+    try:
+        await manager.broadcast(pydantic_entry.model_dump_json())
+    except Exception:
+        pass
 
+    return pydantic_entry
 
 @router.get("/", response_model=list[LogEntry])
 async def get_logs(level: str | None = None, db: AsyncSession = Depends(get_db)):       
@@ -74,6 +80,32 @@ async def slow_fetch(ids: str, db: AsyncSession = Depends(get_db)):
         if entry:
             results.append(LogEntry.model_validate(entry))
     return results
+
+@router.websocket("/ws/tail")
+async def log_tail(websocket: WebSocket):
+    await manager.connect(websocket)
+    try:
+        while True:
+            await asyncio.sleep(1)
+    except WebSocketDisconnect:
+        manager.disconnect(websocket)
+
+@router.post("/batch", status_code=status.HTTP_202_ACCEPTED)
+async def ingest_log_batch(batch: LogBatch):
+    producer = await get_producer()
+    current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+    tasks = []
+    for entry in batch.entries:
+        message_payload = {
+            "level": entry.level,
+            "message": entry.message,
+            "timestamp": current_time
+        }
+        task = producer.send(topic="log-events", value=message_payload)
+        tasks.append(task)
+    await asyncio.gather(*tasks)
+    return {"status": "accepted", "message": f"Enqueued {len(batch.entries)} messages"}
 
 
 @router.get("/{log_id}", response_model=LogEntry)

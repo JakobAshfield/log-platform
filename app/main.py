@@ -6,14 +6,16 @@ from app.routers import auth
 from prometheus_fastapi_instrumentator import Instrumentator
 import os
 from app.database import engine, Base
-
+from app.kafka_producer import get_producer, stop_producer
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if os.getenv("ENV") != "test":
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
+        await get_producer()
     yield
+    await stop_producer()
 
 
 app = FastAPI(title="Log Platform", lifespan=lifespan)
