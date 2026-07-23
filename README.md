@@ -2,11 +2,14 @@
 
 A production-shaped distributed log processing platform built with FastAPI, PostgreSQL, Redis, Kafka, and a full Prometheus + Grafana observability stack. Designed to ingest, store, query, and stream log events at high volume with real-time delivery, live dashboards, and structured logging built in.
 
+The Log Platform ingests log events from applications, stores them durably, makes them queryable in real time, and provides observability into its own operation.
+
+
 ---
 
 ## Features
 
-**Ingest**
+**Ingest:** Two Paths
 - `POST /logs` — single log entry, writes directly to Postgres, broadcasts to all WebSocket clients
 - `POST /logs/batch` — bulk ingest via Kafka, returns `202 Accepted` immediately, consumer writes to Postgres asynchronously in micro-batches of up to 100 messages per 1s window
 - Rate limiting on ingest: sliding window via Redis, configurable limit and window per IP
@@ -259,7 +262,7 @@ Postgres can absorb moderate write rates but becomes a bottleneck under sustaine
 One INSERT per message means one round-trip to Postgres per message. Batching up to 100 messages into a single bulk INSERT reduces that to one round-trip per batch regardless of batch size. Under load the consumer was sustaining multiple 100-row batches per second with no Postgres connection pressure.
 
 **Why two consumer groups?**
-The log-writer and alert-system consumer groups both read `log-events` independently. Kafka gives each group its own offset — the alerter being slow or restarting never delays the writer. This is the advantage of a log-based broker over a traditional queue where each message is consumed once.
+The log-writer and alert-system consumer groups both read `log-events` independently. Kafka gives each group its own offset, the alerter being slow or restarting never delays the writer. This is the advantage of a log-based broker over a traditional queue where each message is consumed once.
 
 **Why Redis cache-aside and not write-through?**
 Write-through caches every write: the cache always has the latest value but you pay the write cost on every ingest. Cache-aside only populates on reads, so hot entries are cached and cold entries never consume cache memory. 
