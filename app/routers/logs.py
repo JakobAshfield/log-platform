@@ -1,5 +1,10 @@
 import asyncio
 import datetime
+import json
+import boto3
+import logging
+import os
+import uuid
 from fastapi import APIRouter, HTTPException, status, Depends, BackgroundTasks, Response, WebSocket, WebSocketDisconnect
 from app.models import LogBatch, LogEntry, LogEntryCreate
 from sqlalchemy.ext.asyncio import AsyncSession 
@@ -12,9 +17,29 @@ from app.websocket_manager import manager
 from app.kafka_producer import get_producer
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
-#log_entries: dict[int, LogEntry] = {}
-#next_id = 1
+s3 = boto3.client("s3")
+BUCKET = os.getenv("S3_BUCKET", "")
+
+def archive_to_s3(batch_data: list[dict]):
+    if not BUCKET:
+        return
+    current_date = datetime.datetime.now(datetime.timezone.utc).date()
+    key = f"raw-logs/{current_date}/{uuid.uuid4()}.json"
+
+    try:
+        s3.put_object(
+            Bucket=BUCKET,
+            Key=key,
+            Body=json.dumps(batch_data),
+            ContentType="application/json"
+        )
+        logger.info("Batch archived to S3", extra={"key": key, "count": len(batch_data)})
+    except Exception as e:
+        logger.error("S3 archive failed", extra={"error": str(e)})
+
+
 
 async def warm_cache(entry: LogEntry) -> None:
     try: 
@@ -90,21 +115,26 @@ async def log_tail(websocket: WebSocket):
     except WebSocketDisconnect:
         manager.disconnect(websocket)
 
-@router.post("/batch", status_code=status.HTTP_202_ACCEPTED)
-async def ingest_log_batch(batch: LogBatch):
+@router.post("/batch", dependencies=[Depends(get_current_user)], status_code=status.HTTP_202_ACCEPTED)
+async def ingest_log_batch(batch: LogBatch, background_tasks: BackgroundTasks):
     producer = await get_producer()
     current_time = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
     tasks = []
+    raw_payload_cache = []
     for entry in batch.entries:
         message_payload = {
             "level": entry.level,
             "message": entry.message,
             "timestamp": current_time
         }
+        raw_payload_cache.append(message_payload)
         task = producer.send(topic="log-events", value=message_payload)
         tasks.append(task)
     await asyncio.gather(*tasks)
+
+    background_tasks.add_task(archive_to_s3, raw_payload_cache)
+
     return {"status": "accepted", "message": f"Enqueued {len(batch.entries)} messages"}
 
 
